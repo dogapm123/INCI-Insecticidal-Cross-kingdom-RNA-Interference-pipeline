@@ -1,0 +1,9 @@
+# Core INCI modules and supporting analysis scripts.
+# External executables and optional dsRIP dependencies are documented in README.md.
+# Versions are not yet locked to a reproduced environment.
+matplotlib
+numpy
+openpyxl
+pandas
+Pillow
+pysam

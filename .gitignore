@@ -1,0 +1,42 @@
+# This workspace also holds local sequencing data and analysis results.
+# Track the pipeline source explicitly so those files stay local.
+/*
+!/.gitignore
+!/README.md
+!/requirements*.txt
+!/LICENSE*
+!/CITATION.cff
+!/AGENTS.md
+!/*.py
+!/dsRNA_identification
+!/dsRNA_plotter
+!/tests/
+!/scripts/
+!/docs/
+!/.github/
+
+# Only reusable scripts required by the pipeline are included initially.
+/scripts/*
+!/scripts/README.md
+!/scripts/run_genome_dsrna_loci.py
+!/scripts/deduplicate_fasta_cdhit_est.py
+!/scripts/screen_genome_250bp_dsrna.py
+
+# Generated files and local settings anywhere in the source tree.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+.idea/
+.vscode/
+venv/
+.venv/
+node_modules/
+.env
+.env.*
+*.log
+*.egg-info/
+build/
+dist/
