@@ -30,6 +30,10 @@ from pathlib import Path
 from typing import Any
 
 from degradome_analysis import DegradomeConfig, DegradomeSample, normalize_pvalue_method, run_degradome_analysis
+from dsrip_sirna_api import DsRipApiError, SiRnaPredictionConfig, predict_sirna_regions
+from dsrna_adaptation import AdaptationConfig, run_dsrna_adaptation
+from bowtie_multitranscriptome_adaptation import CORE_PRETRIMMED_DM_MRNA_FASTA, CORE_PRETRIMMED_TC_MRNA_FASTA, run_batch_multi_transcriptome_adaptation
+from multi_transcriptome_adaptation_plot import render_batch_adaptation_plots, run as render_multi_transcriptome_adaptation_plots
 from sirna_annotations import draw_sirna_annotation_track, find_sirna_annotations, write_sirna_annotation_table
 from target_prediction import TargetPredictionConfig, run_target_prediction
 
@@ -214,6 +218,40 @@ MODULES: tuple[ModuleSpec, ...] = (
         ),
     ),
     ModuleSpec(
+        "dsrna-enhancement",
+        "dsRNA Enhancement",
+        "Prioritize stronger RNAi triggers using sequence and structural context.",
+        ("transcriptome", "srna_fasta"),
+        (
+            OutputSpec("Enhanced dsRNA designs", "enhanced_dsrna_designs.tsv"),
+            OutputSpec("Best dsRNA FASTA", "efficiency/best_dsRNA_regions.fasta"),
+            OutputSpec("siRNA prediction workbook", "efficiency/siRNA_predictions.xlsx"),
+            OutputSpec("Off-target screen", "off_target_summary.tsv"),
+            OutputSpec("Run report", "dsrna_enhancement_report.html"),
+        ),
+    ),
+    ModuleSpec(
+        "dsrna-adaptation",
+        "siRNA Adaptation",
+        "Compare multiple siRNA or dsRNA input sets across named transcriptomes with size-normalized, shuffle-adjusted adaptation statistics.",
+        ("transcriptome",),
+        (
+            OutputSpec("Input-set manifest", "tables/batch_input_sets.tsv"),
+            OutputSpec("Per-set transcriptome adaptation ranking", "tables/batch_multi_transcriptome_adaptation_ranking.tsv"),
+            OutputSpec("Merged per-siRNA adaptation statistics", "tables/batch_multi_transcriptome_adaptation_per_sirna.tsv"),
+            OutputSpec("Merged detailed siRNA–transcript hits", "tables/batch_multi_transcriptome_adaptation_target_hits.tsv"),
+            OutputSpec("Cross-set adaptation summary", "plots/batch_adaptation_summary.svg"),
+            OutputSpec("Per-set summary graphs and detailed tables", "sets/<input_set>/plots and sets/<input_set>/tables"),
+        ),
+    ),
+    ModuleSpec(
+        "blast-tool",
+        "BLAST Tool",
+        "Run local sequence homology searches against selected FASTA databases.",
+        ("transcriptome",),
+        (OutputSpec("BLAST hits", "blast_hits.tsv"), OutputSpec("Run report", "blast_report.html")),
+    ),
+    ModuleSpec(
         "fasta-deduplication",
         "FASTA Deduplication",
         "Cluster nucleotide FASTA records with CD-HIT-EST and keep nonredundant representatives.",
@@ -225,6 +263,28 @@ MODULES: tuple[ModuleSpec, ...] = (
             OutputSpec("Run manifest", "run_manifest.json"),
         ),
     ),
+    ModuleSpec(
+        "rnai-susceptibility",
+        "RNAi Susceptibility Prediction",
+        "Summarize features that will feed a future susceptibility model.",
+        ("rnaseq", "transcriptome", "srna_fasta", "degradome", "srnaseq"),
+        (
+            OutputSpec("Prediction table", "rnai_susceptibility_predictions.tsv"),
+            OutputSpec("Feature matrix", "rnai_feature_matrix.tsv"),
+            OutputSpec("Run report", "rnai_susceptibility_report.html"),
+        ),
+    ),
+    ModuleSpec(
+        "orthology-inference",
+        "Orthology Inference",
+        "Infer orthologous relationships from the transcriptome FASTA input.",
+        ("transcriptome",),
+        (
+            OutputSpec("Orthology groups", "orthology_groups.tsv"),
+            OutputSpec("Best reciprocal hits", "best_reciprocal_hits.tsv"),
+            OutputSpec("Run report", "orthology_inference_report.html"),
+        ),
+    ),
 )
 
 
@@ -232,8 +292,8 @@ MODULE_GROUPS: tuple[ModuleGroup, ...] = (
     ModuleGroup("RNA-seq Preprocessing", ("preprocessing",)),
     ModuleGroup("dsRNA Analysis", ("dsrna-identification", "dsrna-plotter")),
     ModuleGroup("Small RNA Analysis", ("srna-mapping", "srna-dsrna-identification", "srna-control-filtering")),
-    ModuleGroup("Target Analysis", ("target-prediction", "degradome-analysis")),
-    ModuleGroup("Supporting Tools", ("fasta-deduplication",)),
+    ModuleGroup("Target Analysis", ("target-prediction", "degradome-analysis", "dsrna-adaptation")),
+    ModuleGroup("Supporting Tools", ("dsrna-enhancement", "blast-tool", "fasta-deduplication", "rnai-susceptibility", "orthology-inference")),
 )
 
 
@@ -246,7 +306,12 @@ TOOL_PURPOSES: dict[str, str] = {
     "srna-control-filtering": "Remove control-mapping and low-complexity small RNAs.",
     "target-prediction": "Predict small RNA target sites in transcripts.",
     "degradome-analysis": "Test predicted targets for degradome cleavage support.",
+    "dsrna-adaptation": "Compare siRNA adaptation across transcriptomes.",
+    "dsrna-enhancement": "Prioritize dsRNA designs with stronger RNAi potential.",
+    "blast-tool": "Search local sequences against FASTA databases.",
     "fasta-deduplication": "Collapse redundant FASTA records into representatives.",
+    "rnai-susceptibility": "Summarize evidence relevant to RNAi susceptibility.",
+    "orthology-inference": "Infer orthologous relationships between transcripts.",
 }
 
 
@@ -263,6 +328,7 @@ MODULE_DATASETS: dict[str, tuple[str, ...]] = {
     "srna-mapping": ("srnaseq", "rnaseq"),
     "srna-dsrna-identification": ("srnaseq",),
     "degradome-analysis": ("degradome",),
+    "rnai-susceptibility": ("rnaseq", "srnaseq", "degradome"),
 }
 
 
@@ -271,10 +337,11 @@ EXTERNAL_TOOLS: tuple[ExternalToolSpec, ...] = (
     ExternalToolSpec("cutadapt", "Cutadapt", ("cutadapt",), "cutadapt", "cutadapt", "RNA-seq Preprocessing", "Configurable adapter and quality trimming for sequencing reads."),
     ExternalToolSpec("bowtie", "Bowtie 1", ("bowtie", "bowtie-build"), "bowtie", "bowtie", "Small RNA and Target Analysis", "Short-read alignment and reference indexing."),
     ExternalToolSpec("samtools", "SAMtools", ("samtools",), "samtools", "samtools", "dsRNA Analysis", "SAM/BAM conversion, sorting, indexing, and filtering."),
-    ExternalToolSpec("minimap2", "minimap2", ("minimap2",), "minimap2", "minimap2", "dsRNA Analysis", "Fast sequence mapping for transcript and genome-scale references."),
-    ExternalToolSpec("seqkit", "SeqKit", ("seqkit",), "seqkit", "seqkit", "dsRNA Identification", "Read subsampling for the initial genomic dsRNA screen."),
-    ExternalToolSpec("viennarna", "ViennaRNA", ("RNAplex",), "viennarna", "viennarna", "Target Analysis", "RNA duplex energy and structural scoring with RNAplex."),
+    ExternalToolSpec("minimap2", "minimap2", ("minimap2",), "minimap2", "minimap2", "dsRNA Analysis and Orthology", "Fast sequence mapping for transcript and genome-scale references."),
+    ExternalToolSpec("viennarna", "ViennaRNA", ("RNAfold", "RNAplex"), "viennarna", "viennarna", "dsRNA and Target Analysis", "RNA folding, duplex energy, and structural scoring."),
+    ExternalToolSpec("blast", "NCBI BLAST+", ("blastn", "makeblastdb"), "blast", "blast", "BLAST Tool and Orthology", "Local sequence similarity searches and database construction."),
     ExternalToolSpec("cd-hit", "CD-HIT", ("cd-hit-est",), "cd-hit", "cd-hit", "FASTA Deduplication", "Nucleotide FASTA clustering and nonredundant representative selection with CD-HIT-EST."),
+    ExternalToolSpec("bedtools", "BEDTools", ("bedtools",), "bedtools", "bedtools", "Supporting Tools", "Interval extraction and genomic range operations."),
 )
 
 
@@ -5034,6 +5101,274 @@ def start_target_prediction_job(settings: dict[str, Any]) -> str:
     return job_id
 
 
+def dsrna_adaptation_output_dir(state: dict[str, Any] | None = None) -> Path:
+    return project_output_root(state) / "dsrna-adaptation"
+
+
+def render_dsrna_adaptation_content(state: dict[str, Any]) -> str:
+    module_paths = state.get("module_paths", {}).get("dsrna-adaptation", {})
+    module_paths = module_paths if isinstance(module_paths, dict) else {}
+    sirna_path = str(module_paths.get("dsrna_fasta", "")).strip()
+    input_sets_text = str(module_paths.get("input_sets", "")).strip()
+    if not input_sets_text and sirna_path:
+        input_sets_text = f"input_set={sirna_path}"
+    transcriptome_default, _ = effective_path(state, "transcriptome", "dsrna-adaptation")
+    transcriptomes_text = str(module_paths.get("transcriptomes", "")).strip()
+    if not transcriptomes_text and transcriptome_default:
+        transcriptomes_text = f"transcriptome={transcriptome_default}"
+    if transcriptomes_text:
+        transcriptomes_text = "\n".join(
+            line for line in transcriptomes_text.splitlines()
+            if line.split("=", 1)[0].strip() not in {"Dm_mRNA", "OGS3_mRNA", "Tc_mRNA"}
+        )
+    output_dir = tool_output_root("dsrna-adaptation", state)
+    ranking = output_dir / "tables" / "batch_multi_transcriptome_adaptation_ranking.tsv"
+    pairwise = output_dir / "tables" / "batch_multi_transcriptome_adaptation_pairwise.tsv"
+    summary = output_dir / "tables" / "batch_multi_transcriptome_adaptation_per_sirna.tsv"
+    hits = output_dir / "tables" / "batch_multi_transcriptome_adaptation_target_hits.tsv"
+    manifest = output_dir / "tables" / "batch_input_sets.tsv"
+    plots = output_dir / "plots"
+    batch_plot = plots / "batch_adaptation_summary.svg"
+    batch_plot_card = (
+        f'''<a class="plot-card" href="/reveal?path={url_for(batch_plot)}"><strong>Cross-set adaptation summary</strong><img src="{output_file_url(batch_plot)}" alt="Cross-set adaptation summary"></a>'''
+        if batch_plot.is_file() else ''
+    )
+    return f"""
+        <section class="hero">
+            <div>
+                <p class="eyebrow">Target analysis</p>
+                <h2>siRNA Adaptation</h2>
+                <p class="muted">Quantify sequence adaptation symmetrically across multiple transcriptomes. Each transcriptome receives the same original and dinucleotide-shuffled siRNAs, then is ranked after its own transcriptome-size normalization.</p>
+            </div>
+            <div class="button-row top-actions">
+                <a class="button-link" href="/reveal?path={url_for(output_dir)}">Open Output Folder</a>
+            </div>
+        </section>
+        <div class="notice" id="status">Each transcriptome receives a global, size-normalized adaptation excess and P value versus matched dinucleotide-shuffled siRNAs. No focal or control transcriptome is required.</div>
+        <section class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">Inputs</p><h3>Defined siRNAs and transcriptomes</h3></div></div>
+            <div class="settings-grid">
+                <label class="field"><span>Input mode for all FASTA sets</span><select id="adaptation-input-mode" onchange="updateAdaptationInputMode()"><option value="direct_sirnas" selected>Defined siRNA lists — one FASTA record per observed siRNA</option><option value="dsrna_windows">dsRNA loci — generate all 21-nt sense/antisense windows</option></select></label>
+            </div>
+            <div class="settings-grid">
+                <label class="field"><span>Input set name</span><input id="adaptation-input-set-name" placeholder="e.g. Node343_highCPM"></label>
+                <label class="field"><span>siRNA/dsRNA FASTA</span><div class="file-picker"><input id="adaptation-input-set-fasta" placeholder="Select a FASTA file"><button type="button" class="secondary" onclick="browseAdaptationInput('adaptation-input-set-fasta')">Browse</button></div></label>
+            </div>
+            <div class="button-row"><button type="button" class="secondary" onclick="addAdaptationInputSet()">Add selected FASTA set</button></div>
+            <label class="field"><span>Selected input FASTA sets</span><textarea id="adaptation-input-sets" placeholder="Node343_highCPM=/path/highCPM_siRNAs.fasta&#10;NC80001=/path/NC80001_siRNAs.fasta">{esc(input_sets_text)}</textarea></label>
+            <div id="adaptation-sirna-paste-panel">
+                <div class="settings-grid">
+                    <label class="field"><span>Pasted siRNA set name</span><input id="adaptation-pasted-set-name" value="pasted_siRNAs"></label>
+                    <label class="field"><span>Paste siRNA FASTA</span><textarea id="adaptation-sirna-paste" placeholder=">siRNA_1&#10;AAACTTCCATTTGTCCATATT&#10;>siRNA_2&#10;ACTGTAGTGTCCGAGTAGATA"></textarea></label>
+                </div>
+                <p class="muted">Paste is available only for defined siRNA lists. Use the FASTA file selector for dsRNA loci.</p>
+            </div>
+            <p class="muted">Each FASTA set is analysed independently with its own matched dinucleotide-shuffle null model, then merged into cross-set summary tables and plots. Use dsRNA mode when every selected FASTA contains one or more loci to expand into all possible siRNAs.</p>
+            <div class="settings-grid">
+                <label class="field"><span>Transcriptome name</span><input id="adaptation-transcriptome-name" placeholder="e.g. CSFB"></label>
+                <label class="field"><span>Transcriptome FASTA</span><div class="file-picker"><input id="adaptation-transcriptome-fasta" placeholder="Select transcriptome FASTA"><button type="button" class="secondary" onclick="browseAdaptationInput('adaptation-transcriptome-fasta')">Browse</button></div></label>
+            </div>
+            <div class="button-row"><button type="button" class="secondary" onclick="addAdaptationTranscriptome()">Add selected transcriptome</button></div>
+            <label class="field"><span>Selected transcriptome FASTAs</span><textarea id="adaptation-transcriptomes" placeholder="CSFB=/path/CSFB.fasta&#10;Pchr=/path/Pchr.fasta">{esc(transcriptomes_text)}</textarea></label>
+            <div class="settings-grid">
+                <label class="inline-check"><input id="adaptation-include-dm-control" type="checkbox" checked><span>Include core Dm mRNA control</span></label>
+                <label class="inline-check"><input id="adaptation-include-tc-control" type="checkbox" checked><span>Include core Tc / OGS3 mRNA control</span></label>
+            </div>
+            <p class="muted">Core Dm and Tc/OGS3 controls are pre-trimmed and pre-indexed within INCI. Select either control without providing a FASTA path.</p>
+            <div class="button-row">
+                <button type="button" class="secondary" data-rapid-adaptation-test data-dsrna-path="{esc(str(APP_DIR / 'data' / 'dsrna_adaptation_rapid_test.fasta'))}" onclick="loadRapidAdaptationTest()">Load 21-nt rapid test sRNA</button>
+                <button type="button" class="secondary" data-pasted-reference-sirnas data-dsrna-path="{esc(str(APP_DIR / 'data' / 'dsrna_adaptation_pasted_reference_sirnas.fasta'))}" onclick="loadPastedReferenceSiRNAs()">Load pasted reference siRNAs</button>
+            </div>
+            <p class="muted">Defined siRNAs are the primary workflow: each FASTA record is analysed as one observed molecule. Headers of the form <code>&lt;locus&gt;_&lt;position&gt;pos_&lt;length&gt;len_&lt;strand&gt;_...</code> preserve locus and strand annotations.</p>
+        </section>
+        <section class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">Adaptation screen</p><h3>Mapping and null-model settings</h3></div></div>
+            <div class="settings-grid">
+                <label class="field"><span>Mapping method</span><select id="adaptation-mapping-backend"><option value="bowtie1" selected>Bowtie1 (-v, -a, --nofw)</option><option value="hamming_scan">Index-free exhaustive Hamming scan</option></select></label>
+                <label class="field"><span>Dinucleotide controls per siRNA</span><input id="adaptation-shuffles" type="number" min="1" max="1000" value="3"></label>
+                <label class="field"><span>Guide length (nt)</span><input id="adaptation-guide-length" type="number" min="15" max="30" value="21"></label>
+                <label class="field"><span>Maximum substitutions</span><input id="adaptation-bowtie-mismatches" type="number" min="0" max="3" step="1" value="0"></label>
+                <label class="field"><span>Maximum explicit G:U/U:G wobble pairs</span><input id="adaptation-wobble-pairs" type="number" min="0" max="3" step="1" value="1"></label>
+                <label class="field"><span>Matched-null permutations</span><input id="adaptation-permutations" type="number" min="1000" max="1000000" step="1000" value="100000"></label>
+                <label class="field"><span>Bowtie threads (Bowtie1 only)</span><input id="adaptation-threads" type="number" min="1" max="32" value="8"></label>
+                <label class="field"><span>Random seed</span><input id="adaptation-seed" type="number" value="1"></label>
+                <label class="field"><span>Minimum terminal poly(A) length</span><input id="adaptation-poly-a-min-length" type="number" min="1" max="1000" value="10"></label>
+            </div>
+            <div class="button-row"><label class="inline-check"><input id="adaptation-ignore-q1" type="checkbox" checked><span>Ignore first 5' guide nucleotide in pairing/MFE scoring (INCI target-prediction default)</span></label><label class="inline-check"><input id="adaptation-trim-poly-a" type="checkbox"><span>Trim terminal 3′ poly(A) tails from working transcriptome copies</span></label></div>
+            <p class="muted">Bowtie1 reports every ungapped reverse-complement site within the mismatch limit. Core Dm and Tc/OGS3 controls are pre-trimmed and pre-indexed; other unchanged transcriptomes reuse persistent indexes.</p>
+            {render_analysis_action('dsrna-adaptation', 'runDsrnaAdaptation()', 'Run Adaptation Test')}
+        </section>
+        <section class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">Outputs</p><h3>Adaptation statistics and plots</h3></div></div>
+            <div class="button-row">
+                <a class="ghost" href="/reveal?path={url_for(manifest)}">Input-set manifest</a>
+                <a class="ghost" href="/reveal?path={url_for(ranking)}">Per-set transcriptome P values and ranking</a>
+                <a class="ghost" href="/reveal?path={url_for(pairwise)}">Per-set pairwise comparisons</a>
+                <a class="ghost" href="/reveal?path={url_for(summary)}">Detailed per-siRNA statistics</a>
+                <a class="ghost" href="/reveal?path={url_for(hits)}">Detailed siRNA–transcript hit statistics</a>
+                <a class="ghost" href="/reveal?path={url_for(batch_plot)}">Cross-set adaptation summary</a>
+                <a class="ghost" href="/reveal?path={url_for(output_dir / 'sets')}">Per-set plots and tables</a>
+                <a class="ghost" href="/reveal?path={url_for(plots)}">All summary plots</a>
+            </div>
+            <div class="plot-grid">{batch_plot_card}</div>
+        </section>
+    """
+
+
+def parse_dsrna_adaptation_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    values = {"input_mode": str(payload.get("input_mode", "direct_sirnas")).strip()}
+    input_sets: list[tuple[str, str]] = []
+    raw_input_sets = str(payload.get("input_sets", "")).strip()
+    if not raw_input_sets and str(payload.get("dsrna_fasta", "")).strip():
+        raw_input_sets = f"input_set={str(payload.get('dsrna_fasta', '')).strip()}"
+    for raw in raw_input_sets.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if "=" not in line:
+            raise ValueError("Each input FASTA set must use set_name=FASTA_path.")
+        name, raw_path = (part.strip() for part in line.split("=", 1))
+        path = Path(raw_path).expanduser()
+        if not name or not path.is_file():
+            raise ValueError(f"Invalid siRNA or dsRNA input-set entry: {line}")
+        input_sets.append((name, str(path)))
+    if not input_sets:
+        input_sets = []
+    pasted_sirnas = str(payload.get("pasted_sirnas", "")).strip()
+    if pasted_sirnas:
+        if values["input_mode"] != "direct_sirnas":
+            raise ValueError("Pasted sequence input is available only in defined-siRNA mode. Select a dsRNA FASTA file instead.")
+        raw_pasted_name = str(payload.get("pasted_set_name", "pasted_siRNAs")).strip()
+        pasted_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_pasted_name).strip("._")
+        if not pasted_name:
+            raise ValueError("Provide a valid name for the pasted siRNA set.")
+        pasted_path = OUTPUT_DIR / "dsrna-adaptation" / "pasted_inputs" / f"{pasted_name}.fasta"
+        write_pasted_fasta(pasted_sirnas, pasted_path, pasted_name)
+        input_sets.append((pasted_name, str(pasted_path)))
+    if not input_sets:
+        raise ValueError("Provide at least one selected FASTA input set or paste a defined siRNA FASTA list.")
+    if len({name for name, _ in input_sets}) != len(input_sets):
+        raise ValueError("Input-set names must be unique.")
+    values["input_sets"] = tuple(input_sets)
+    transcriptomes: list[tuple[str, str]] = []
+    for raw in str(payload.get("transcriptomes", "")).splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if "=" not in line:
+            raise ValueError("Each transcriptome line must use name=FASTA_path.")
+        name, raw_path = (part.strip() for part in line.split("=", 1))
+        path = Path(raw_path).expanduser()
+        if not name or not path.is_file():
+            raise ValueError(f"Invalid transcriptome entry: {line}")
+        transcriptomes.append((name, str(path)))
+    for enabled, name, path in (
+        (bool(payload.get("include_dm_control", False)), "Dm_mRNA", CORE_PRETRIMMED_DM_MRNA_FASTA),
+        (bool(payload.get("include_tc_control", payload.get("include_ogs3_control", False))), "Tc_mRNA", CORE_PRETRIMMED_TC_MRNA_FASTA),
+    ):
+        if not enabled:
+            continue
+        if not path.is_file():
+            raise ValueError(f"Core pre-trimmed control {name} is unavailable: {path}")
+        transcriptomes.append((name, str(path)))
+    if len(transcriptomes) < 2:
+        raise ValueError("Provide at least two named transcriptomes.")
+    if len({name for name, _ in transcriptomes}) != len(transcriptomes):
+        raise ValueError("Transcriptome names must be unique.")
+    values["transcriptomes"] = tuple(transcriptomes)
+    try:
+        values["shuffle_count"] = int(payload.get("shuffle_count", 3))
+        values["guide_length"] = int(payload.get("guide_length", 21))
+        values["threads"] = int(payload.get("threads", 4))
+        values["seed"] = int(payload.get("seed", 1))
+        values["mismatches"] = int(payload.get("bowtie_mismatches", 0))
+        values["wobble_max_pairs"] = int(payload.get("wobble_max_pairs", 1))
+        values["global_permutations"] = int(payload.get("global_permutations", 100000))
+        values["poly_a_min_length"] = int(payload.get("poly_a_min_length", 10))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Adaptation settings must be valid numeric values.") from exc
+    if not 1 <= values["shuffle_count"] <= 1000:
+        raise ValueError("Dinucleotide controls per siRNA must be between 1 and 1,000.")
+    if not 15 <= values["guide_length"] <= 30:
+        raise ValueError("siRNA length must be between 15 and 30 nt.")
+    if not 1 <= values["threads"] <= 32:
+        raise ValueError("Bowtie threads must be between 1 and 32.")
+    if values["input_mode"] not in {"direct_sirnas", "dsrna_windows"}:
+        raise ValueError("Input mode must be a defined siRNA list or a dsRNA locus.")
+    values["mapping_backend"] = str(payload.get("mapping_backend", "bowtie1")).strip()
+    if values["mapping_backend"] not in {"hamming_scan", "bowtie1"}:
+        raise ValueError("Mapping method must be the index-free Hamming scan or Bowtie1.")
+    if not 0 <= values["mismatches"] <= 3:
+        raise ValueError("Maximum substitutions must be between 0 and 3.")
+    if not 0 <= values["wobble_max_pairs"] <= 3:
+        raise ValueError("Maximum wobble pairs must be between 0 and 3.")
+    if not 1000 <= values["global_permutations"] <= 1_000_000:
+        raise ValueError("Matched-null permutations must be between 1,000 and 1,000,000.")
+    if not 1 <= values["poly_a_min_length"] <= 1000:
+        raise ValueError("Minimum terminal poly(A) length must be between 1 and 1,000 nt.")
+    values["ignore_query_pos1"] = bool(payload.get("ignore_query_pos1", True))
+    values["trim_terminal_poly_a"] = bool(payload.get("trim_terminal_poly_a", False))
+    return values
+
+
+def start_dsrna_adaptation_job(settings: dict[str, Any]) -> str:
+    job_id = create_pipeline_job("siRNA adaptation")
+    prepare_tool_output_dir("dsrna-adaptation")
+
+    def worker() -> None:
+        try:
+            state = load_state()
+            output_dir = dsrna_adaptation_output_dir(state)
+            append_job_log(job_id, f"Mapping {len(settings['input_sets'])} siRNA/dsRNA set(s) across {len(settings['transcriptomes'])} transcriptomes with independent matched-shuffle null models.")
+            result = run_batch_multi_transcriptome_adaptation(
+                tuple((name, Path(path)) for name, path in settings["input_sets"]),
+                tuple((name, Path(path)) for name, path in settings["transcriptomes"]),
+                output_dir,
+                shuffle_count=settings["shuffle_count"], guide_length=settings["guide_length"],
+                ignore_query_pos1=settings["ignore_query_pos1"], threads=settings["threads"], seed=settings["seed"],
+                input_mode=settings["input_mode"], mismatches=settings["mismatches"], wobble_max_pairs=settings["wobble_max_pairs"],
+                global_permutations=settings["global_permutations"], trim_terminal_poly_a=settings["trim_terminal_poly_a"],
+                poly_a_min_length=settings["poly_a_min_length"],
+                mapping_backend=settings["mapping_backend"],
+            )
+            individual_plots = {}
+            for set_result in result["set_results"]:
+                individual_plots[str(set_result["input_set"])] = render_multi_transcriptome_adaptation_plots(
+                    Path(str(set_result["outdir"])), settings["input_mode"]
+                )
+            result["plot_outputs"] = {"batch": render_batch_adaptation_plots(output_dir), "sets": individual_plots}
+            state.setdefault("module_paths", {}).setdefault("dsrna-adaptation", {}).update({
+                "input_sets": "\n".join(f"{name}={path}" for name, path in settings["input_sets"]),
+                "transcriptomes": "\n".join(f"{name}={path}" for name, path in settings["transcriptomes"]),
+            })
+            save_state(state)
+        except Exception as exc:
+            finish_pipeline_job(job_id, "failed", {"message": str(exc)}, f"siRNA adaptation failed: {exc}")
+            return
+        finish_pipeline_job(job_id, "finished", result, f"siRNA adaptation finished for {result.get('input_set_count', 0):,} input set(s), containing {result.get('sirna_count', 0):,} siRNA(s), across {result.get('transcriptome_count', 0):,} transcriptomes.")
+
+    threading.Thread(target=worker, name=f"inci-dsrna-adaptation-{job_id[:8]}", daemon=True).start()
+    return job_id
+
+
+def run_dsrna_enhancement(state: dict[str, Any]) -> dict[str, Any]:
+    apply_global_plot_settings(state)
+    transcriptome_path, source = effective_path(state, "transcriptome", "dsrna-enhancement")
+    if not transcriptome_path:
+        raise ValueError("Add a transcriptome FASTA path before running dsRNA Enhancement.")
+
+    output_dir = project_output_root(state) / "dsrna-enhancement"
+    result = predict_sirna_regions(
+        SiRnaPredictionConfig(
+            fasta_path=Path(transcriptome_path),
+            output_dir=output_dir,
+            safety=False,
+        )
+    )
+    result["input_source"] = source
+    return result
+
+
 def run_dsrna_plotter(state: dict[str, Any], job_id: str | None = None) -> dict[str, Any]:
     apply_global_plot_settings(state)
     rnaseq_path, rnaseq_source = effective_path(state, "rnaseq", "dsrna-plotter")
@@ -5289,6 +5624,8 @@ def run_module(module_key: str, state: dict[str, Any], params: dict[str, Any] | 
         return run_dsrna_identification(state, params)
     if module_key == "dsrna-plotter":
         return run_dsrna_plotter(state)
+    if module_key == "dsrna-enhancement":
+        return run_dsrna_enhancement(state)
     if module_key == "fasta-deduplication":
         return run_fasta_deduplication(state, params)
     raise ValueError("This pipeline section does not have a runnable action yet.")
@@ -5730,6 +6067,8 @@ def render_module_content(module: ModuleSpec, state: dict[str, Any]) -> str:
         return render_degradome_content(state)
     if module.key == "target-prediction":
         return render_target_prediction_content(state)
+    if module.key == "dsrna-adaptation":
+        return render_dsrna_adaptation_content(state)
     if module.key == "dsrna-identification":
         return render_dsrna_identification_content(state)
 
@@ -5750,10 +6089,29 @@ def render_module_content(module: ModuleSpec, state: dict[str, Any]) -> str:
         </section>
         {render_dsrna_plotter_results(output_dir)}
         """
+    elif module.key == "dsrna-enhancement":
+        controls = f"""
+        <section class="panel">
+            <div class="panel-heading">
+                <div>
+                    <p class="eyebrow">Runnable action</p>
+                    <h3>siRNA Efficiency Prediction</h3>
+                    <p>Run the dsRIP predictor on the selected transcriptome FASTA and write the enhanced dsRNA outputs below.</p>
+                </div>
+            </div>
+            {render_analysis_action(module.key, f"runModule('{module.key}')", 'Run Prediction')}
+        </section>
+        """
     elif module.key == "fasta-deduplication":
         controls = render_fasta_deduplication_controls(state, output_dir)
     else:
-        raise ValueError("Unknown pipeline section.")
+        controls = f"""
+        <section class="panel">
+            <p class="eyebrow">Implementation placeholder</p>
+            <h3>Analysis Controls</h3>
+            <p class="muted">This area is reserved for the offline pipeline controls, parameters, progress logs, and result summaries for {esc(module.title)}.</p>
+        </section>
+        """
 
     return f"""
         <section class="hero">
@@ -5766,7 +6124,7 @@ def render_module_content(module: ModuleSpec, state: dict[str, Any]) -> str:
                 <a class="button-link" href="/reveal?path={url_for(output_dir)}">Open Output Folder</a>
             </div>
         </section>
-        <div class="notice" id="status">Ready. Review the inputs before starting.</div>
+        <div class="notice" id="status">{'Ready. Review the inputs before starting.' if module.key in {'dsrna-plotter', 'dsrna-enhancement', 'fasta-deduplication'} else 'This tool is not available yet.'}</div>
         {render_module_dataset_selectors(state, module.key)}
         {render_dsrna_reference_selector(state, module.key) if module.key in {'dsrna-identification', 'dsrna-plotter'} else ''}
         {controls}
@@ -6549,6 +6907,107 @@ def render_scripts() -> str:
                 top_n: Number(document.getElementById('dsrna-top-n')?.value || 20),
                 sirna_annotations_fasta: document.getElementById('dsrna-sirna-annotations-fasta')?.value.trim() || ''
             };
+        }
+
+        async function browseAdaptationInput(inputId) {
+            setStatus('Opening local file chooser...');
+            const response = await fetch('/browse-degradome-input');
+            const data = await response.json();
+            if (!response.ok || !data.path) {
+                setStatus(data.message || 'No file selected.', 'warn');
+                return;
+            }
+            const input = document.getElementById(inputId);
+            if (input) input.value = data.path;
+            setStatus('Input selected.');
+        }
+
+        function appendAdaptationNamedFasta(nameId, fastaId, listId, label) {
+            const nameInput = document.getElementById(nameId);
+            const fastaInput = document.getElementById(fastaId);
+            const list = document.getElementById(listId);
+            const fasta = fastaInput?.value.trim() || '';
+            let name = nameInput?.value.trim() || '';
+            if (!name && fasta) {
+                const filename = fasta.split('/').pop() || '';
+                name = filename.replace(/\\.(fasta|fa|fas|fna)$/i, '') || 'input';
+            }
+            if (!name || !fasta || !list) {
+                setStatus(`Choose a ${label} FASTA file and provide a name.`, 'warn');
+                return;
+            }
+            const entry = `${name}=${fasta}`;
+            const existing = list.value.split(/\\r?\\n/).map(line => line.trim()).filter(Boolean);
+            if (existing.some(line => line.split('=', 1)[0].trim() === name)) {
+                setStatus(`${label} name '${name}' is already present.`, 'warn');
+                return;
+            }
+            list.value = [...existing, entry].join('\\n');
+            if (nameInput) nameInput.value = '';
+            if (fastaInput) fastaInput.value = '';
+            setStatus(`Added ${label} '${name}'.`, 'success');
+        }
+
+        function addAdaptationInputSet() {
+            appendAdaptationNamedFasta('adaptation-input-set-name', 'adaptation-input-set-fasta', 'adaptation-input-sets', 'input set');
+        }
+
+        function addAdaptationTranscriptome() {
+            appendAdaptationNamedFasta('adaptation-transcriptome-name', 'adaptation-transcriptome-fasta', 'adaptation-transcriptomes', 'transcriptome');
+        }
+
+        function updateAdaptationInputMode() {
+            const mode = document.getElementById('adaptation-input-mode')?.value || 'direct_sirnas';
+            const pastePanel = document.getElementById('adaptation-sirna-paste-panel');
+            if (pastePanel) pastePanel.hidden = mode !== 'direct_sirnas';
+        }
+
+        function dsrnaAdaptationPayload() {
+            const inputMode = document.getElementById('adaptation-input-mode')?.value || 'direct_sirnas';
+            return {
+                input_sets: document.getElementById('adaptation-input-sets')?.value || '',
+                pasted_set_name: document.getElementById('adaptation-pasted-set-name')?.value.trim() || 'pasted_siRNAs',
+                pasted_sirnas: inputMode === 'direct_sirnas' ? (document.getElementById('adaptation-sirna-paste')?.value || '') : '',
+                transcriptomes: document.getElementById('adaptation-transcriptomes')?.value || '',
+                include_dm_control: document.getElementById('adaptation-include-dm-control')?.checked ?? true,
+                include_tc_control: document.getElementById('adaptation-include-tc-control')?.checked ?? true,
+                input_mode: inputMode,
+                shuffle_count: Number(document.getElementById('adaptation-shuffles')?.value || 3),
+                guide_length: Number(document.getElementById('adaptation-guide-length')?.value || 21),
+                bowtie_mismatches: Number(document.getElementById('adaptation-bowtie-mismatches')?.value || 0),
+                mapping_backend: document.getElementById('adaptation-mapping-backend')?.value || 'bowtie1',
+                wobble_max_pairs: Number(document.getElementById('adaptation-wobble-pairs')?.value || 1),
+                global_permutations: Number(document.getElementById('adaptation-permutations')?.value || 100000),
+                ignore_query_pos1: document.getElementById('adaptation-ignore-q1')?.checked ?? true,
+                trim_terminal_poly_a: document.getElementById('adaptation-trim-poly-a')?.checked ?? false,
+                poly_a_min_length: Number(document.getElementById('adaptation-poly-a-min-length')?.value || 10),
+                threads: Number(document.getElementById('adaptation-threads')?.value || 4),
+                seed: Number(document.getElementById('adaptation-seed')?.value || 1)
+            };
+        }
+
+        function loadRapidAdaptationTest() {
+            const preset = document.querySelector('[data-rapid-adaptation-test]');
+            const inputSets = document.getElementById('adaptation-input-sets');
+            if (inputSets && preset) inputSets.value = `rapid_test=${preset.dataset.dsrnaPath || ''}`;
+            setStatus('Loaded the 21-nt rapid-test siRNA set.', 'success');
+        }
+
+        function loadPastedReferenceSiRNAs() {
+            const preset = document.querySelector('[data-pasted-reference-sirnas]');
+            const input = document.getElementById('adaptation-input-sets');
+            const mode = document.getElementById('adaptation-input-mode');
+            if (input && preset) input.value = `pasted_reference=${preset.dataset.dsrnaPath || ''}`;
+            if (mode) mode.value = 'direct_sirnas';
+            setStatus('Loaded the defined reference siRNA set.', 'success');
+        }
+
+        async function runDsrnaAdaptation() {
+            setStatus('Starting siRNA adaptation test...');
+            const data = await requestToolRun('/run-dsrna-adaptation', dsrnaAdaptationPayload(), 'Could not start siRNA adaptation.');
+            if (!data) return;
+            setStatus(data.message || 'siRNA adaptation started. Progress will appear in the process console.', 'success');
+            if (data.job_id) pollPipelineJob(data.job_id, true);
         }
 
         async function saveDsrnaReference(moduleKey, reload = true) {
@@ -8279,6 +8738,26 @@ class InciRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if self.path == "/run-dsrna-adaptation":
+            try:
+                settings = parse_dsrna_adaptation_payload(payload)
+                job_id = start_dsrna_adaptation_job(settings)
+            except ValueError as exc:
+                self.respond_json({"ok": False, "message": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self.respond_json({"ok": False, "message": f"Could not start siRNA adaptation: {exc}"}, status=500)
+                return
+
+            self.respond_json(
+                {
+                    "ok": True,
+                    "message": "siRNA adaptation started. Progress will appear in the process console.",
+                    "job_id": job_id,
+                }
+            )
+            return
+
         if self.path == "/run-module":
             module_key = str(payload.get("module_key", ""))
             if module_for_key(module_key) is None or module_key == "preprocessing":
@@ -8300,12 +8779,12 @@ class InciRequestHandler(BaseHTTPRequestHandler):
                         }
                     )
                     return
-                if module_key not in {'dsrna-identification', 'fasta-deduplication'}:
+                if module_key not in {'dsrna-identification', 'dsrna-enhancement', 'fasta-deduplication'}:
                     raise ValueError('This tool is not available yet.')
                 job_id = start_module_job(module_key, params)
                 self.respond_json({'ok': True, 'job_id': job_id, 'message': 'Analysis started.'})
                 return
-            except ValueError as exc:
+            except (ValueError, DsRipApiError) as exc:
                 self.respond_json({"ok": False, "message": str(exc)}, status=400)
                 return
             except Exception as exc:
